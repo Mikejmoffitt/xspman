@@ -1,4 +1,4 @@
-#include "xbase/util/xspman.h"
+#include "xspman.h"
 
 #include <stdlib.h>
 #include <string.h>
