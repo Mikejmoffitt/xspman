@@ -5,21 +5,79 @@
 #include <stdio.h>
 #include <stddef.h>
 
+#define PCG_PATTERN_BYTES ((16*16)/2)
+
+// Endianness macros
+
+static inline uint16_t endian_swap_w(uint16_t in)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return ((in & 0xFF00) >> 8) | ((in & 0xFF) << 8);
+#else
+	return in;
+#endif
+}
+
+static inline uint32_t endian_swap_l(uint32_t in)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	const uint16_t hiword = (in >> 16) & 0xFFFF;
+	const uint16_t loword = in & 0xFFFF;
+	return (endian_swap_w(hiword)<<16) |
+	       (endian_swap_w(loword));
+#else
+	return in;
+#endif
+}
+
 // =============================================================================
 // Data structures and static data
 // =============================================================================
 
+// Frame data.
+typedef struct
+{
+	short vx;  // 相対座標データ Relative X coordinate data
+	short vy;  // 相対座標データ Relative Y coordinate data
+	short pt;  // スプライトパターン Sprite pattern no.
+	short rv;  // 反転コード Reflection code
+} XspFrmDat;
+_Static_assert(sizeof(XspFrmDat) == 8);
+
+// Ref as kept in memory.
+typedef struct
+{
+	short num;             // 合成スプライト数 Composite sprite FRM data count
+	const XspFrmDat *ptr;  // Absolute pointer to start of FRM data
+	short unused;          //（未使用）(Unused)
+} XspRefDat;
+
+// Ref as loaded from the file. Data is big endian.
+typedef struct
+{
+	short num;          // 合成スプライト数 Composite sprite FRM data count
+	uint32_t ptr_offs;  // Offset within FRM data block.
+	short unused;       //（未使用）(Unused)
+} XspRefDatFile;
+_Static_assert(sizeof(XspRefDatFile) == 8);
+
+enum
+{
+	XSB_TYPE_XSP,
+	XSB_TYPE_SP,
+};
+
 // Definition for "XSB" bundle format from png2xsp.
 typedef struct XSBHeader
 {
-	unsigned short type;  // XSP(0) or SP(1)
-	unsigned short ref_count;  // ref bytes / 8;  0 for sp
-	unsigned short frm_bytes;  // frm bytes; 0 for sp
-	unsigned short pcg_count;  // valid for both xsp and sp
-	unsigned short pal[16];
-	unsigned int ref_offs;
-	unsigned int frm_offs;
-	unsigned int pcg_offs;
+	uint16_t type;       // XSP(0) or SP(1)
+	uint16_t ref_count;  // ref bytes / 8sizeof(XspRefDatFile);  0 for sp
+	uint16_t frm_count;  // frm count; 0 for sp.
+	uint16_t pcg_count;  // valid for both xsp and sp
+	uint16_t pal[16];
+	uint32_t ref_offs;
+	uint32_t frm_offs;
+	uint32_t pcg_offs;
 } XSBHeader;
 
 enum
@@ -34,34 +92,33 @@ struct XSPManFileNode
 {
 	char fname_base[256];
 	XSPManFileNode *next;
-	unsigned short ref_bytes;
-	unsigned short frm_bytes;
-	unsigned int pcg_bytes;
-	short filetype;
+	uint16_t ref_count;
+	uint16_t frm_count;
+	uint16_t pcg_count;
+	int16_t filetype;
 };
 
 static struct
 {
 	bool loaded;  // If true, registration is complete.
 
-	char *frmdat;  // Internal, referenced by ref/objdat.
-	char *refdat;  // REF data.
-	char *pcgdat;  // PCG pattern data.
-	char *pcg_alt;  // Scratchpad for PCG data.
-	short pcg_alt_bytes;  // Size of scratchpad.
+	XspFrmDat *frmdat;  // referenced by ref/objdat.
+	XspRefDat *refdat;  // REF data.
+	uint8_t *pcgdat;    // PCG pattern data.
+	char *pcg_alt;      // Scratchpad for PCG data.
 
 	// File lists.
 	XSPManFileNode *file_list;
 
 	// Buffer sizes.
-	unsigned short ref_bytes;
-	unsigned short frm_bytes;
-	unsigned int pcg_bytes;
+	uint16_t ref_count;
+	uint16_t frm_count;
+	uint16_t pcg_count;
 
 	// Load indices.
-	int ref_load_offs;
-	int frm_load_offs;
-	int pcg_load_offs;
+	int ref_load_idx;
+	int frm_load_idx;
+	int pcg_load_idx;
 } s_xspman;
 
 // =============================================================================
@@ -85,88 +142,94 @@ FILE *file_open_sub(const char *fname_base, const char *ext, int filetype)
 	return fopen(fname_buffer, "rb");
 }
 
-int add_ref_data(const char *fname_base, int bytes, int filetype)
+int load_ref_data(const char *fname_base, int count, int filetype)
 {
 	// Load the REF data into the REF buffer.
 	FILE *f = file_open_sub(fname_base, "ref", filetype);
 	if (!f) return 0;
-	char *ref = &s_xspman.refdat[s_xspman.ref_load_offs];
+
+	// Read in file ref data.
 	if (filetype == XSPMAN_FILE_BUNDLE)
 	{
 		fseek(f, offsetof(XSBHeader, ref_offs), SEEK_SET);
-		unsigned int offs;
-		fread(&offs, sizeof(unsigned int), 1, f);
-		printf("@$%X;", offs);
+		uint32_t offs;
+		fread(&offs, sizeof(uint32_t), 1, f);
+		offs = endian_swap_l(offs);
 		fseek(f, offs, SEEK_SET);
 	}
-	bytes = fread(ref, 1, bytes, f);
-	fclose(f);
 
-	// The REF data as it comes contains offsets from the start of the FRM data
-	// block. We have to rebase it against the start of the FRM block in RAM.
-	const unsigned int frm_base_addr =
-	    (unsigned int)&s_xspman.frmdat[s_xspman.frm_load_offs];
-	for (short i = 0; i < bytes / 8; i++)
+	const XspFrmDat *frm_base = &s_xspman.frmdat[s_xspman.frm_load_idx];
+	// Each file ref data with relative frm offsets is converted to the
+	// ref data in memory that contains a native absolute pointer.
+	const uint8_t *frm_raw = (const uint8_t *)(frm_base);
+	for (int i = 0; i < count; i++)
 	{
-		// Starting from the second byte is the FRM data offset.
-		const short ref_offs = (i * 8) + 2;
-		// In order to add the FRM_DAT base address, we will access it directly
-		// by casting as an unsigned int.
-		unsigned int *frm_ptr = (unsigned int *)(&ref[ref_offs]);
-		*frm_ptr += frm_base_addr;
+		XspRefDatFile ref_file;
+		fread(&ref_file, sizeof(ref_file), 1, f);
+		ref_file.num = endian_swap_w(ref_file.num);
+		ref_file.ptr_offs = endian_swap_l(ref_file.ptr_offs);
+
+		XspRefDat *ref = &s_xspman.refdat[s_xspman.ref_load_idx+i];
+		ref->num = ref_file.num;
+		ref->ptr = (const XspFrmDat *)(frm_raw+ref_file.ptr_offs);
 	}
 
-	return bytes;
+	fclose(f);
+
+	return count;
 }
 
-int add_frm_data(const char *fname_base, int bytes, int filetype)
+int load_frm_data(const char *fname_base, int count, int filetype)
 {
 	// Load the FRM data into the FRM buffer.
 	FILE *f = file_open_sub(fname_base, "frm", filetype);
 	if (!f) return 0;
-	char *frm = &s_xspman.frmdat[s_xspman.frm_load_offs];
+
+	XspFrmDat *frm_base = &s_xspman.frmdat[s_xspman.frm_load_idx];
 	if (filetype == XSPMAN_FILE_BUNDLE)
 	{
 		fseek(f, offsetof(XSBHeader, frm_offs), SEEK_SET);
-		unsigned int offs;
-		fread(&offs, sizeof(unsigned int), 1, f);
-		printf("@$%X;", offs);
+		uint32_t offs;
+		offs = endian_swap_l(offs);
+		fread(&offs, sizeof(uint32_t), 1, f);
 		fseek(f, offs, SEEK_SET);
 	}
-	bytes = fread(frm, 1, bytes, f);
+	fread(frm_base, sizeof(XspFrmDat), count, f);
 	fclose(f);
 
-	// The FRM data as it comes contains pattern numbers within the PCG data
-	// block. We must increment the pattern code to match the loaded number.
-	for (short i = 0; i < bytes / 8; i++)
+	// Rebase pattern data and fix endianness.
+	const short pt_base = s_xspman.pcg_load_idx;
+	for (int i = 0; i < count; i++)
 	{
-		const short frm_offs = (i * 8) + 4;
-		short *pt = (short *)&frm[frm_offs];
-		*pt += (s_xspman.pcg_load_offs / 128);
+		XspFrmDat *frm = &frm_base[i];
+		frm->vx = endian_swap_w(frm->vx);
+		frm->vy = endian_swap_w(frm->vy);
+		frm->pt = endian_swap_w(frm->pt) + pt_base;
+		frm->rv = endian_swap_w(frm->rv);
 	}
-
-	return bytes;
+	return count;
 }
 
-int add_pcg_data(const char *fname_base, int bytes, int filetype)
+int load_pcg_data(const char *fname_base, int count, int filetype)
 {
 	// Load the PCG data into the PCG buffer.
 	FILE *f = file_open_sub(fname_base,
 	                        filetype == XSPMAN_FILE_XSP ? "xsp" : "sp",
 	                        filetype);
 	if (!f) return 0;
+	
 	if (filetype == XSPMAN_FILE_BUNDLE)
 	{
 		fseek(f, offsetof(XSBHeader, pcg_offs), SEEK_SET);
-		unsigned int offs;
-		fread(&offs, sizeof(unsigned int), 1, f);
-		printf("@$%X;", offs);
+		uint32_t offs;
+		offs = endian_swap_l(offs);
+		fread(&offs, sizeof(uint32_t), 1, f);
 		fseek(f, offs, SEEK_SET);
 	}
-	bytes = fread(&s_xspman.pcgdat[s_xspman.pcg_load_offs], 1, bytes, f);
+	fread(&s_xspman.pcgdat[s_xspman.pcg_load_idx*PCG_PATTERN_BYTES], PCG_PATTERN_BYTES, count, f);
 	fclose(f);
 
-	return bytes;
+	return count;
 }
 
 // =============================================================================
@@ -184,9 +247,10 @@ static void free_file_list(XSPManFileNode *current)
 	}
 }
 
-static void add_file(const char *fname_base,
-                     int ref_bytes, int frm_bytes, int pcg_bytes, int filetype)
+static void add_file(const char *fname_base, int filetype,
+                     int ref_count, int frm_count, int pcg_count)
 {
+	// Add a new node or create the list
 	XSPManFileNode *newnode = NULL;
 	if (s_xspman.file_list == NULL)
 	{
@@ -204,14 +268,17 @@ static void add_file(const char *fname_base,
 		newnode = current->next;
 	}
 
+	// Register information
 	strncpy(newnode->fname_base, fname_base, sizeof(newnode->fname_base)-1);
 	newnode->next = NULL;
 	newnode->filetype = filetype;
-	newnode->ref_bytes = ref_bytes;
-	newnode->frm_bytes = frm_bytes;
-	newnode->pcg_bytes = pcg_bytes;
-	printf("%s:\t REF $%06X\tFRM $%06X\tPCG $%06X\n", newnode->fname_base,
-	       newnode->ref_bytes, newnode->frm_bytes, newnode->pcg_bytes);
+	newnode->ref_count = ref_count;
+	newnode->frm_count = frm_count;
+	newnode->pcg_count = pcg_count;
+	printf("REF %d FRM %d PCG %d\n",
+	       newnode->ref_count,
+	       newnode->frm_count,
+	       newnode->pcg_count);
 }
 
 // =============================================================================
@@ -235,132 +302,149 @@ static int get_file_bytes(const char *fname_base, const char *ext)
 	return fsize;
 }
 
-short xspman_reg_bundle(const char *fname, unsigned short *pal)
+int16_t xspman_reg_bundle(const char *fname, uint16_t *pal)
 {
-	if (s_xspman.loaded) return -1;
-	printf("[xspman] %s : ", fname);
+	int16_t ret = -1;
+	if (s_xspman.loaded) return ret;
+
+	printf("[xspman] Spec %s: ", fname);
 	FILE *f = fopen(fname, "rb");
 	if (!f)
 	{
 		printf("Read Error\n");
-		return -1;
+		return ret;
 	}
 	XSBHeader header;
 	fread(&header, 1, sizeof(header), f);
 	fclose(f);
 
-	if (pal)
+	// Endian fixes
+	header.type = endian_swap_w(header.type);
+	header.ref_count = endian_swap_w(header.ref_count);
+	header.frm_count = endian_swap_w(header.frm_count);
+	header.pcg_count = endian_swap_w(header.pcg_count);
+	for (uint16_t i = 0; i < 16; i++)
 	{
-		memcpy(pal, header.pal, sizeof(header.pal));
+		header.pal[i] = endian_swap_w(header.pal[i]);
+	}
+	header.ref_offs = endian_swap_l(header.ref_offs);
+	header.frm_offs = endian_swap_l(header.frm_offs);
+	header.pcg_offs = endian_swap_l(header.pcg_offs);
+
+	if (pal) memcpy(pal, header.pal, sizeof(header.pal));
+
+	switch (header.type)
+	{
+		case XSB_TYPE_XSP:
+			ret = s_xspman.ref_count;
+			break;
+
+		case XSB_TYPE_SP:
+			ret = s_xspman.pcg_count;
+			break;
+
+		default:
+			printf("Error: bundle type %d\n", header.type);
+			break;
 	}
 
-	short ret = -1;
-
-	if (header.type == 0)  // XSP
-	{
-		ret = s_xspman.ref_bytes / 8;  // XOBJ no.
-	}
-	else if (header.type == 1)  // sp
-	{
-		ret = s_xspman.pcg_bytes / 128;  // PT no.
-	}
-	else
-	{
-		printf("Error: type %d\n", header.type);
-		return ret;
-	}
-	s_xspman.ref_bytes += (header.ref_count * 8);
-	s_xspman.frm_bytes += header.frm_bytes;
-	s_xspman.pcg_bytes += header.pcg_count * 128;
-	add_file(fname, header.ref_count * 8, header.frm_bytes,
-	         header.pcg_count * 128, XSPMAN_FILE_BUNDLE);
+	s_xspman.ref_count += header.ref_count;
+	s_xspman.frm_count += header.frm_count;
+	s_xspman.pcg_count += header.pcg_count;
+	add_file(fname, XSPMAN_FILE_BUNDLE,
+	         header.ref_count, header.frm_count, header.pcg_count);
 	return ret;
 }
 
-short xspman_reg_xsp(const char *fname_base)
+int16_t xspman_reg_xsp(const char *fname_base)
 {
 	if (s_xspman.loaded) return -1;
 
+	const int ret = s_xspman.ref_count;  // Xobj no.
+
+	// Read as many refs as we can, and deduce the xobj count from that.
 	const int ref_bytes = get_file_bytes(fname_base, "ref");
 	if (ref_bytes < 0) return -1;
-	if (ref_bytes % 8 != 0)
+	if (ref_bytes % sizeof(XspRefDatFile) != 0)
 	{
 		printf("[xspman] Unusual REF file size for %s\n", fname_base);
 		return -1;
 	}
-	const int ret = s_xspman.ref_bytes / 8;  // This gives us the XOBJ no.
-	s_xspman.ref_bytes += ref_bytes;
+	const int ref_count = ref_bytes / sizeof(XspRefDatFile);
+	s_xspman.ref_count += ref_count;
 
+	// Read associated FRM data.
 	const int frm_bytes = get_file_bytes(fname_base, "frm");
 	if (frm_bytes < 0) return -1;
-	if (frm_bytes % 8 != 0)
+	if (frm_bytes % sizeof(XspFrmDat) != 0)
 	{
 		printf("[xspman] Unusual FRM file size for %s\n", fname_base);
 		return -1;
 	}
-	s_xspman.frm_bytes += frm_bytes;
+	const int frm_count = frm_bytes / sizeof(XspFrmDat);
+	s_xspman.frm_count += frm_count;
 
+	// and finally PCG data.
 	const int pcg_bytes = get_file_bytes(fname_base, "xsp");
 	if (pcg_bytes < 0) return -1;
-	if (pcg_bytes % 128 != 0)
+	if (pcg_bytes % PCG_PATTERN_BYTES != 0)
 	{
 		printf("[xspman] Unusual PCG file size for %s\n", fname_base);
 		return -1;
 	}
-	s_xspman.pcg_bytes += pcg_bytes;
+	const int pcg_count = pcg_bytes / PCG_PATTERN_BYTES;
+	s_xspman.pcg_count += pcg_count;
 
-	add_file(fname_base, ref_bytes, frm_bytes, pcg_bytes, XSPMAN_FILE_XSP);
+	add_file(fname_base, XSPMAN_FILE_XSP, ref_count, frm_count, pcg_count);
 
 	return ret;
 }
 
-short xspman_reg_sp(const char *fname_base)
+int16_t xspman_reg_sp(const char *fname_base)
 {
 	if (s_xspman.loaded) return -1;
+	const int16_t ret = s_xspman.pcg_count;
 
 	const int pcg_bytes = get_file_bytes(fname_base, "sp");
 	if (pcg_bytes < 0) return -1;
-	if (pcg_bytes % 128 != 0)
+	if (pcg_bytes % PCG_PATTERN_BYTES != 0)
 	{
 		printf("[xspman] Unusual PCG file size for %s\n", fname_base);
 		return -1;
 	}
+	const int pcg_count = pcg_bytes / PCG_PATTERN_BYTES;
+	s_xspman.pcg_count += pcg_count;
 
-	const short ret = s_xspman.pcg_bytes / 128;
-
-	s_xspman.pcg_bytes += pcg_bytes;
-
-	add_file(fname_base, 0, 0, pcg_bytes, XSPMAN_FILE_SP);
+	add_file(fname_base, XSPMAN_FILE_SP, 0, 0, pcg_count);
 	return ret;
 }
+
+
 
 bool xspman_load(void)
 {
 	if (s_xspman.loaded) return false;
 
-	printf("[xspman] Buffer summary:\n");
-	printf("  FRM: %d bytes\n", s_xspman.frm_bytes);
-	printf("  REF: %d bytes\n", s_xspman.ref_bytes);
-	printf("  PCG: %d bytes\n", s_xspman.pcg_bytes);
+	printf("[xspman] Data Summary: FRM %d REF %d PCG %d\n",
+	       s_xspman.frm_count, s_xspman.ref_count, s_xspman.pcg_count);
 
 	// Create buffers based on surveyed data from registration.
-	s_xspman.frmdat = malloc(s_xspman.frm_bytes);
+	s_xspman.frmdat = malloc(s_xspman.frm_count * sizeof(XspFrmDat));
 	if (!s_xspman.frmdat) return false;
-	s_xspman.refdat = malloc(s_xspman.ref_bytes);
+	s_xspman.refdat = malloc(s_xspman.ref_count * sizeof(XspRefDat));
 	if (!s_xspman.refdat)
 	{
 		free(s_xspman.frmdat);
 		return false;
 	}
-	s_xspman.pcgdat = malloc(s_xspman.pcg_bytes);
+	s_xspman.pcgdat = malloc(s_xspman.pcg_count * PCG_PATTERN_BYTES);
 	if (!s_xspman.pcgdat)
 	{
 		free(s_xspman.frmdat);
 		free(s_xspman.refdat);
 		return false;
 	}
-	s_xspman.pcg_alt_bytes = (s_xspman.pcg_bytes / 128) + 1;
-	s_xspman.pcg_alt = malloc(s_xspman.pcg_alt_bytes);
+	s_xspman.pcg_alt = malloc(s_xspman.pcg_count+1);
 	if (!s_xspman.pcgdat)
 	{
 		free(s_xspman.frmdat);
@@ -373,7 +457,7 @@ bool xspman_load(void)
 	XSPManFileNode *current = s_xspman.file_list;
 	while (current != NULL)
 	{
-		printf("[xspman] %s:\n", current->fname_base);
+		printf("[xspman] Load %s... ", current->fname_base);
 		if (current->filetype != XSPMAN_FILE_SP)
 		{
 			// Loading an XOBJ file requires multiple steps. The complication,
@@ -389,24 +473,21 @@ bool xspman_load(void)
 			//   * Has a PCG pattern no. (rebased against PCG number base)
 
 			// First, load the REF data, and rebase it against frm_base, which is
-			// frmdat[frm_load_offs].
-			printf(",");
-			s_xspman.ref_load_offs += add_ref_data(current->fname_base,
-			                                       current->ref_bytes,
+			// frmdat[frm_load_idx].
+			s_xspman.ref_load_idx += load_ref_data(current->fname_base,
+			                                       current->ref_count,
 			                                       current->filetype);
-			// Next, load the FRM data into frm_base, add to frm_load_offs the
-			// size of the loaded data, and add pcg_load_offs/128 to the pattern
+			// Next, load the FRM data into frm_base, add to frm_load_idx the
+			// size of the loaded data, and add pcg_load_idx/128 to the pattern
 			// field of the FRM data.
-			printf(".");
-			s_xspman.frm_load_offs += add_frm_data(current->fname_base,
-			                                       current->frm_bytes,
+			s_xspman.frm_load_idx += load_frm_data(current->fname_base,
+			                                       current->frm_count,
 			                                       current->filetype);
 		}
-		// Finally, load the PCG data, and increment pcg_load_offs by the number
+		// Finally, load the PCG data, and increment pcg_load_idx by the number
 		// of bytes loaded.
-		printf(".");
-		s_xspman.pcg_load_offs += add_pcg_data(current->fname_base,
-		                                       current->pcg_bytes,
+		s_xspman.pcg_load_idx += load_pcg_data(current->fname_base,
+		                                       current->pcg_count,
 		                                       current->filetype);
 		printf(" OK!\n");
 		// Visit the next.
@@ -429,9 +510,9 @@ char *xspman_get_pcg_alt_ptr(void)
 	return s_xspman.pcg_alt;
 }
 
-short xspman_get_pcg_alt_bytes(void)
+int xspman_get_pcg_alt_bytes(void)
 {
-	return s_xspman.pcg_alt_bytes;
+	return s_xspman.pcg_count+1;
 }
 
 const void *xspman_get_objdat_ptr(void)

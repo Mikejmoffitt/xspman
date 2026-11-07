@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <stdbool.h>
 
 //
@@ -24,15 +25,15 @@ void xspman_init(void);
 // Registers an XSB bundle file.
 // Returns the base sprite number for xobj_set(), or -1 on error.
 // Set pal to NULL if you do not need to load palette data.
-short xspman_reg_bundle(const char *fname_base, unsigned short *pal);
+int16_t xspman_reg_bundle(const char *fname_base, uint16_t *pal);
 
 // Registers an XSP file set.
 // Returns the base sprite number for xobj_set(), or -1 on error.
-short xspman_reg_xsp(const char *fname_base);
+int16_t xspman_reg_xsp(const char *fname_base);
 
 // Registers an XSP file set.
 // Returns the base PCG pattern number for xsp_set(), or -1 on error.
-short xspman_reg_sp(const char *fname_base);
+int16_t xspman_reg_sp(const char *fname_base);
 
 //
 // 3) File loading
@@ -58,7 +59,7 @@ const void *xspman_get_pcgdat_ptr(void);
 char *xspman_get_pcg_alt_ptr(void);
 
 // Returns the size of the array referened by xspman_get_pcg_alt_ptr().
-short xspman_get_pcg_alt_bytes(void);
+int xspman_get_pcg_alt_bytes(void);
 
 // Returns a pointer to OBJ reference data. The data it points to remains valid
 // until xspman_shutdown() is called.
