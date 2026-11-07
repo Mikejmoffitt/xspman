@@ -41,16 +41,8 @@ typedef struct
 	short vy;  // 相対座標データ Relative Y coordinate data
 	short pt;  // スプライトパターン Sprite pattern no.
 	short rv;  // 反転コード Reflection code
-} XspFrmDat;
+} __attribute__((packed)) XspFrmDat;
 _Static_assert(sizeof(XspFrmDat) == 8);
-
-// Ref as kept in memory.
-typedef struct
-{
-	short num;             // 合成スプライト数 Composite sprite FRM data count
-	const XspFrmDat *ptr;  // Absolute pointer to start of FRM data
-	short unused;          //（未使用）(Unused)
-} XspRefDat;
 
 // Ref as loaded from the file. Data is big endian.
 typedef struct
@@ -58,8 +50,16 @@ typedef struct
 	short num;          // 合成スプライト数 Composite sprite FRM data count
 	uint32_t ptr_offs;  // Offset within FRM data block.
 	short unused;       //（未使用）(Unused)
-} XspRefDatFile;
+} __attribute__((packed))  XspRefDatFile;
 _Static_assert(sizeof(XspRefDatFile) == 8);
+
+// Ref as kept in memory.
+typedef struct
+{
+	short num;             // 合成スプライト数 Composite sprite FRM data count
+	const XspFrmDat *ptr;  // Absolute pointer to start of FRM data
+	short unused;          //（未使用）(Unused)
+} __attribute__((packed)) XspRefDat;
 
 enum
 {
@@ -78,7 +78,7 @@ typedef struct XSBHeader
 	uint32_t ref_offs;
 	uint32_t frm_offs;
 	uint32_t pcg_offs;
-} XSBHeader;
+} __attribute__((packed))  XSBHeader;
 
 enum
 {
