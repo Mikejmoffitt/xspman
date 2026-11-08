@@ -23,8 +23,8 @@ static inline uint32_t endian_swap_l(uint32_t in)
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	const uint16_t hiword = (in >> 16) & 0xFFFF;
 	const uint16_t loword = in & 0xFFFF;
-	return (endian_swap_w(hiword)<<16) |
-	       (endian_swap_w(loword));
+	return (endian_swap_w(loword)<<16) |
+	       (endian_swap_w(hiword));
 #else
 	return in;
 #endif
@@ -170,6 +170,7 @@ int load_ref_data(const char *fname_base, int count, int filetype)
 		ref_file.ptr_offs = endian_swap_l(ref_file.ptr_offs);
 
 		XspRefDat *ref = &s_xspman.refdat[s_xspman.ref_load_idx+i];
+//		printf("ref %d @ %p : %d frames, offs %X\n", i, ref, ref_file.num, ref_file.ptr_offs);
 		ref->num = ref_file.num;
 		ref->ptr = (const XspFrmDat *)(frm_raw+ref_file.ptr_offs);
 	}
@@ -190,8 +191,9 @@ int load_frm_data(const char *fname_base, int count, int filetype)
 	{
 		fseek(f, offsetof(XSBHeader, frm_offs), SEEK_SET);
 		uint32_t offs;
-		offs = endian_swap_l(offs);
 		fread(&offs, sizeof(uint32_t), 1, f);
+		offs = endian_swap_l(offs);
+//		printf("FRM offs = $%X\n", (int)offs);
 		fseek(f, offs, SEEK_SET);
 	}
 	fread(frm_base, sizeof(XspFrmDat), count, f);
@@ -202,10 +204,12 @@ int load_frm_data(const char *fname_base, int count, int filetype)
 	for (int i = 0; i < count; i++)
 	{
 		XspFrmDat *frm = &frm_base[i];
+//		printf("frm %d @ %p\n", i, frm);
 		frm->vx = endian_swap_w(frm->vx);
 		frm->vy = endian_swap_w(frm->vy);
 		frm->pt = endian_swap_w(frm->pt) + pt_base;
 		frm->rv = endian_swap_w(frm->rv);
+//		printf("  pt %02d : +%d, +%d\n", frm->pt, frm->vx, frm->vy);
 	}
 	return count;
 }
@@ -222,8 +226,8 @@ int load_pcg_data(const char *fname_base, int count, int filetype)
 	{
 		fseek(f, offsetof(XSBHeader, pcg_offs), SEEK_SET);
 		uint32_t offs;
-		offs = endian_swap_l(offs);
 		fread(&offs, sizeof(uint32_t), 1, f);
+		offs = endian_swap_l(offs);
 		fseek(f, offs, SEEK_SET);
 	}
 	fread(&s_xspman.pcgdat[s_xspman.pcg_load_idx*PCG_PATTERN_BYTES], PCG_PATTERN_BYTES, count, f);
